@@ -43,15 +43,16 @@ class OpenLLMLoader(DataLoader):
 class HelmsLoader(DataLoader):
     """Loader for HELM Lite benchmark datasets."""
 
-    def load(self, dataset_name: str) -> Tuple[np.ndarray, List[str], np.ndarray]:
+    def load(self, dataset_name: str) -> Tuple[np.ndarray, np.ndarray, List[str], np.ndarray]:
         helm = HelmLite(tasks=[dataset_name])
         helm.download_and_check()
         dataset = helm.get_datasets()
 
         scores = np.array(dataset["acc"]).T.astype(np.float32)
+        model_outputs = np.array(dataset["model_outputs"]).T
         model_names = helm.models
         true_acc = scores.mean(axis=1)
-        return scores, model_names, true_acc
+        return scores, model_outputs, model_names, true_acc
 
 
 class GlueLoader(DataLoader):

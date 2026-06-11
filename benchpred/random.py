@@ -203,7 +203,7 @@ class RandomSearchAndLearn(BenchPred):
         seed=42,
         *args,
         **kwargs
-    ):
+    ): # infinite recursion length bug?
         num_model = source_full_scores.shape[0]
         num_data = source_full_scores.shape[1]
 
@@ -344,7 +344,7 @@ def _make_krr_random_variant(base_cls, degree=2):
             )
 
         def fit(self, *args, **kwargs):
-            result = super().fit(*args, **kwargs)
+            result = super().fit(*args, **kwargs) # TODO: infinite recursion depth error with (krandom_search_and_learn)
             self.search_metrics = None
             return result
 

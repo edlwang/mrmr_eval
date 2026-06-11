@@ -45,7 +45,8 @@ openllm_datasets = [
 ]
 all_datasets = helm_datasets + glue_datasets + openllm_datasets + ["imagenet"]
 
-
+# TODO: Modify to cache model responses as well
+# IS THIS EVEN USED???
 def get_scores(dataset_name):
     """Return a binary (M models × N items) score matrix for ``dataset_name``.
 
@@ -179,9 +180,14 @@ class Benchmark(ABC):
     def get_accuracies(self, model_name, task_name) -> pd.Series:
         return self.get_meta_infos(model_name, task_name)["acc"]
 
+    def get_model_outputs(self, model_name, task_name) -> pd.Series:
+        return self.get_meta_infos(model_name, task_name)["model_output"]
+
     def get_datasets(self) -> Dataset:
+        # TODO: Expose model response array
         all_task_texts = dict()
         all_task_labels = dict()
+        all_task_model_output = defaultdict(dict)
         all_task_model_perf = defaultdict(dict)
         for task in self.tasks:
             for i, model in enumerate(self.models):
@@ -192,12 +198,13 @@ class Benchmark(ABC):
                     continue
                 all_task_texts[task] = meta_info["text"]
                 all_task_labels[task] = meta_info["label"]
+                all_task_model_output[task][model] = meta_info["model_output"]
                 all_task_model_perf[task][model] = meta_info["acc"]
-
-        ret_texts, ret_perfs, ret_labels, ret_tasks = [], [], [], []
+        ret_texts, ret_perfs, ret_labels, ret_tasks, ret_model_outputs = [], [], [], [], []
         for task_name in self.tasks:
             task_texts = all_task_texts[task_name]
             task_labels = all_task_labels[task_name]
+            
 
             ret_texts += list(task_texts.values)
             ret_labels += list(task_labels.values)
@@ -209,6 +216,13 @@ class Benchmark(ABC):
                 ]
                 for idx in task_texts.index
             ]
+            ret_model_outputs += [
+                [
+                    all_task_model_output[task_name][model_name].loc[idx]
+                    for model_name in self.models
+                ]
+                for idx in task_texts.index
+            ]
 
         ret_dataset = Dataset.from_dict(
             {
@@ -216,6 +230,7 @@ class Benchmark(ABC):
                 "acc": ret_perfs,
                 "label": ret_labels,
                 "task": ret_tasks,
+                "model_outputs": ret_model_outputs
             }
         )
 
@@ -495,6 +510,7 @@ class HelmLite(Benchmark):
                 "text": [],
                 "label": [],
                 "acc": [],
+                "model_output": []
             }
             for ins, pred in zip(instances, predictions):
                 assert ins["id"] == pred["instance_id"]
@@ -503,6 +519,7 @@ class HelmLite(Benchmark):
                 # todo: label is not loaded
                 ret["label"].append(-1)
                 ret["acc"].append(pred["stats"]["acc"])
+                ret["model_output"].append(pred["predicted_text"])
                 ref_text = " ".join(
                     [
                         "%s. %s" % (chr(i + 65), ref["output"]["text"])

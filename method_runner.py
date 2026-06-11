@@ -537,7 +537,8 @@ class MethodRunner:
         """Run all configured methods for a single dataset."""
         print(f"\n=== Running dataset: {dataset_name} ===")
 
-        scores, model_names, true_acc = self.loader.load(dataset_name)
+
+        scores, model_outputs, model_names, true_acc = self.loader.load(dataset_name)
         num_models, num_data = scores.shape
 
         coreset_size = self.resolve_coreset_size(self.config.coreset_size, num_data)
