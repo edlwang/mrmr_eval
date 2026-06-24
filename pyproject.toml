@@ -46,6 +46,17 @@ dependencies = [
     "nbconvert",
 ]
 
+[project.optional-dependencies]
+# DKPS method (response-based, HELM only). Kept optional so core installs are
+# unaffected; benchpred guards the import and skips registering 'dkps' /
+# 'dkps_google' if these are missing. graspologic must be compatible with the
+# numpy<2 pin above -- verify the resolved version imports cleanly before relying
+# on it. google-genai is only needed for the 'dkps_google' (free-text) embedder.
+dkps = [
+    "graspologic",
+    "google-genai",
+]
+
 [tool.setuptools]
 include-package-data = true
 

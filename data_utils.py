@@ -30,7 +30,7 @@ os.makedirs(dir_data_raw, exist_ok=True)
 helm_datasets = [
     "commonsense", "gsm", "legalbench",
     "math", "med_qa", "mmlu",
-    # "narrative_qa", "natural_qa", "wmt_14",  # not binary accuracy
+     "narrative_qa", "natural_qa", "wmt_14",  # not binary accuracy
 ]
 glue_datasets = [
     # "cola",  # not binary accuracy

@@ -299,9 +299,9 @@ class MethodRunner:
         return source_models, target_models
 
     @staticmethod
-    def _run_single_trial(method_name, seed, scores, source_models, target_models,
-                          true_acc, coreset_size, results_base, dataset_name,
-                          exp_suffix, config_dict, use_git,
+    def _run_single_trial(method_name, seed, scores, model_outputs, source_models,
+                          target_models, true_acc, coreset_size, results_base,
+                          dataset_name, exp_suffix, config_dict, use_git,
                           tqdm_position_queue=None, progress_dict=None,
                           mp_progress_mode="terminal"):
         """Execute a single ``(method, seed)`` trial.  Safe for multiprocessing."""
@@ -337,9 +337,10 @@ class MethodRunner:
 
         try:
             return MethodRunner._do_single_trial(
-                method_name, seed, scores, source_models, target_models,
-                true_acc, coreset_size, results_base, dataset_name,
-                exp_suffix, config_dict, use_git, _tqdm_func=_tqdm_func,
+                method_name, seed, scores, model_outputs, source_models,
+                target_models, true_acc, coreset_size, results_base,
+                dataset_name, exp_suffix, config_dict, use_git,
+                _tqdm_func=_tqdm_func,
             )
         except Exception:
             _get_error_logger().error(
@@ -376,10 +377,15 @@ class MethodRunner:
         return False
 
     @staticmethod
-    def _do_single_trial(method_name, seed, scores, source_models, target_models,
-                         true_acc, coreset_size, results_base, dataset_name,
-                         exp_suffix, config_dict, use_git, _tqdm_func=None):
-        """Inner implementation of a single trial (no tqdm management)."""
+    def _do_single_trial(method_name, seed, scores, model_outputs, source_models,
+                         target_models, true_acc, coreset_size, results_base,
+                         dataset_name, exp_suffix, config_dict, use_git,
+                         _tqdm_func=None):
+        """Inner implementation of a single trial (no tqdm management).
+
+        ``model_outputs`` carries raw per-(model, item) responses for methods
+        that set ``requires_model_outputs`` (DKPS); it is ``None`` otherwise.
+        """
         dir_exp = os.path.join(
             results_base,
             f"{dataset_name}{exp_suffix}",
@@ -422,27 +428,70 @@ class MethodRunner:
                 return None
             extra_fit_kwargs["base_ckpt_path"] = base_ckpt
 
+        # Response-based methods (DKPS) consume raw model_outputs instead of the
+        # score matrix; everything else takes the original score-based path.
+        needs_outputs = getattr(method, "requires_model_outputs", False)
+        if needs_outputs and model_outputs is None:
+            raise ValueError(
+                f"Method {method_name!r} requires model responses (model_outputs), "
+                "but none were available. DKPS-family methods only run with "
+                "data_source='helm'."
+            )
+
         timer = Timer()
         timer.start()
-        method.fit(
-            source_full_scores=scores[source_models],
-            coreset_size=coreset_size,
-            seed=seed,
-            **extra_fit_kwargs,
-        )
+        if needs_outputs:
+            method.fit(
+                source_full_scores=scores[source_models],
+                coreset_size=coreset_size,
+                seed=seed,
+                source_model_outputs=model_outputs[source_models],
+                **extra_fit_kwargs,
+            )
+        else:
+            method.fit(
+                source_full_scores=scores[source_models],
+                coreset_size=coreset_size,
+                seed=seed,
+                **extra_fit_kwargs,
+            )
         training_time = timer.get_last_duration()
 
-        compressed_indices = method.get_coreset()
+        # Methods that build a *per-target* adaptive coreset (DKPSMRMRPred)
+        # cannot be expressed as a single coreset of columns: hand predict the
+        # full response matrices instead of a sliced coreset.
+        needs_full = getattr(method, "requires_full_target_outputs", False)
+        test_target_coresets = None
+        if needs_full:
+            if model_outputs is None:
+                raise ValueError(
+                    f"Method {method_name!r} requires full model responses "
+                    "(requires_full_target_outputs), but none were available. "
+                    "DKPS-family methods only run with data_source='helm'."
+                )
+            timer.start()
+            pred_acc_test = method.predict(model_outputs[target_models])
+            inference_time = timer.get_last_duration()
+            # Capture the test-model coresets before the train-model predict
+            # overwrites them.
+            test_target_coresets = getattr(method, "target_coresets_", None)
+            pred_acc_train = method.predict(model_outputs[source_models])
+            compressed_indices = method.get_coreset()  # placeholder (shared seed)
+        else:
+            compressed_indices = method.get_coreset()
 
-        timer.start()
-        pred_acc_test = method.predict(
-            scores[target_models][:, compressed_indices]
-        )
-        inference_time = timer.get_last_duration()
+            if needs_outputs:
+                feats_test = model_outputs[target_models][:, compressed_indices]
+                feats_train = model_outputs[source_models][:, compressed_indices]
+            else:
+                feats_test = scores[target_models][:, compressed_indices]
+                feats_train = scores[source_models][:, compressed_indices]
 
-        pred_acc_train = method.predict(
-            scores[source_models][:, compressed_indices]
-        )
+            timer.start()
+            pred_acc_test = method.predict(feats_test)
+            inference_time = timer.get_last_duration()
+
+            pred_acc_train = method.predict(feats_train)
 
         test_residuals = pred_acc_test - true_acc[target_models]
         error_MAE = float(np.fabs(test_residuals).mean())
@@ -487,6 +536,11 @@ class MethodRunner:
 
         selection_metrics = getattr(method, "selection_metrics", None)
 
+        if test_target_coresets is not None:
+            test_target_coresets = [
+                np.asarray(c).tolist() for c in test_target_coresets
+            ]
+
         result_dict = {
             "seed": seed,
             "coreset_indices": np.asarray(compressed_indices).tolist(),
@@ -501,6 +555,8 @@ class MethodRunner:
         }
         if selection_metrics is not None:
             result_dict["selection_metrics"] = selection_metrics
+        if test_target_coresets is not None:
+            result_dict["target_coresets"] = test_target_coresets
 
         jbl.dump(result_dict, os.path.join(dir_exp, "result.jbl"))
 
@@ -522,6 +578,8 @@ class MethodRunner:
         }
         if selection_metrics is not None:
             ret["selection_metrics"] = selection_metrics
+        if test_target_coresets is not None:
+            ret["target_coresets"] = test_target_coresets
         return ret
 
     def _trial_result_path(self, method_name: str, seed: int, dataset_name: str) -> str:
@@ -553,6 +611,14 @@ class MethodRunner:
 
         config_dict = {k: self.config[k] for k in list(self.config.keys())}
 
+        # Only ship raw responses to workers when a requested method needs them
+        # (DKPS); otherwise pass None so normal runs incur no extra IPC overhead.
+        needs_outputs = any(
+            getattr(all_methods.get(m), "requires_model_outputs", False)
+            for m in self.config.methods
+        )
+        trial_model_outputs = model_outputs if needs_outputs else None
+
         tasks = []
         for seed in range(
             self.config.seed_start, self.config.seed_start + self.config.num_run
@@ -564,7 +630,7 @@ class MethodRunner:
             )
             for method_name in self.config.methods:
                 tasks.append((
-                    method_name, seed, scores,
+                    method_name, seed, scores, trial_model_outputs,
                     source_models, target_models, true_acc,
                     coreset_size, self.results_base, dataset_name,
                     self.config.exp_suffix, config_dict, self.config.use_git,

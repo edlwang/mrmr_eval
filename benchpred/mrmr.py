@@ -10,6 +10,25 @@ from tqdm import tqdm
 from .base import BenchPred, set_random_seed
 
 
+# The LNC estimator adds a tiny deterministic jitter (fixed seeds 0/1) to break
+# ties.  Because the seeds are fixed, the jitter depends only on the sample
+# length n, so it is identical on every call -- cache it instead of
+# regenerating it tens of thousands of times per fit.  Value-identical to the
+# original ``np.random.default_rng(0/1).standard_normal(n)`` calls.
+_LNC_NOISE_CACHE = {}
+
+
+def _lnc_jitter(n):
+    noise = _LNC_NOISE_CACHE.get(n)
+    if noise is None:
+        noise = (
+            np.random.default_rng(0).standard_normal(n),
+            np.random.default_rng(1).standard_normal(n),
+        )
+        _LNC_NOISE_CACHE[n] = noise
+    return noise
+
+
 class MRMRPred(BenchPred):
     """MRMR (Minimum Redundancy Maximum Relevance) coreset selection.
 
@@ -228,8 +247,9 @@ class MRMRPred(BenchPred):
             return 0.0
 
         intens = 1e-10
-        x = x + intens * np.random.default_rng(0).standard_normal(n)
-        y = y + intens * np.random.default_rng(1).standard_normal(n)
+        noise_x, noise_y = _lnc_jitter(n)
+        x = x + intens * noise_x
+        y = y + intens * noise_y
 
         xy = np.column_stack([x, y])
         tree = cKDTree(xy)
@@ -285,6 +305,20 @@ class MRMRPred(BenchPred):
     ) -> np.ndarray:
         """Batch LNC MI between each column of X and a single vector x2.
 
+        Vectorised equivalent of calling
+        ``_mutual_information_lnc(X[:, j], x2)`` for every column ``j``.  The
+        partner vector ``x2`` (and the fixed-seed jitter) is shared across
+        candidates, so the joint / marginal Chebyshev distances, the k-NN
+        gather, the per-point 2x2 covariance and its eigendecomposition are all
+        computed as single batched array ops instead of one cKDTree + ``eigh``
+        per candidate.  This is the redundancy/relevance hotspot on continuous
+        benchmarks (e.g. wmt_14).
+
+        Falls back to the per-column loop when ``X`` or ``x2`` contains
+        non-finite values: the vectorised path assumes one shared, fully finite
+        sample (true during fit, which mean-imputes before selection), whereas
+        the per-column estimator masks NaNs independently per column.
+
         Args:
             X: Matrix of shape (n_samples, n_features).
             x2: Vector of shape (n_samples,).
@@ -294,13 +328,71 @@ class MRMRPred(BenchPred):
         Returns:
             Array of MI values of shape (n_features,).
         """
-        n_features = X.shape[1]
-        mi_values = np.empty(n_features)
-        for j in range(n_features):
-            mi_values[j] = MRMRPred._mutual_information_lnc(
-                X[:, j], x2, k=k, alpha=alpha
-            )
-        return mi_values
+        X = np.asarray(X, dtype=np.float64)
+        x2 = np.asarray(x2, dtype=np.float64).ravel()
+        n, C = X.shape
+
+        if not (np.isfinite(X).all() and np.isfinite(x2).all()):
+            out = np.empty(C)
+            for j in range(C):
+                out[j] = MRMRPred._mutual_information_lnc(
+                    X[:, j], x2, k=k, alpha=alpha
+                )
+            return out
+
+        if n < k + 1:
+            return np.zeros(C)
+
+        intens = 1e-10
+        noise_x, noise_y = _lnc_jitter(n)
+        Xj = X + intens * noise_x[:, None]          # (n, C) jittered candidates
+        yv = x2 + intens * noise_y                  # (n,)  jittered partner
+        XjT = Xj.T                                  # (C, n)
+
+        # Pairwise Chebyshev (L-inf) distances: Dy fixed, Dx per candidate.
+        Dy = np.abs(yv[:, None] - yv[None, :])              # (n, n)
+        Dx = np.abs(XjT[:, :, None] - XjT[:, None, :])      # (C, n, n)
+        Dj = np.maximum(Dx, Dy[None, :, :])                 # (C, n, n)
+
+        # eps_i = distance to the (k+1)-th nearest joint neighbour (self incl.).
+        eps = np.partition(Dj, k, axis=2)[:, :, k]          # (C, n)
+
+        # KSG marginal counts within radius eps - 1e-15 (self removed via -1).
+        r = (eps - 1e-15)[:, :, None]
+        nx = np.maximum((Dx <= r).sum(axis=2) - 1, 1)       # (C, n)
+        ny = np.maximum((Dy[None, :, :] <= r).sum(axis=2) - 1, 1)
+        mi_ksg = psi(k) + psi(n) - (psi(nx + 1) + psi(ny + 1)).mean(axis=1)
+
+        # k+1 nearest-neighbour SET per (candidate, point) for the PCA patch.
+        nbr = np.argpartition(Dj, k, axis=2)[:, :, : k + 1]  # (C, n, k+1)
+        cidx = np.broadcast_to(np.arange(C)[:, None, None], nbr.shape)
+        xj_nbr = Xj[nbr, cidx]                               # (C, n, k+1)
+        yv_nbr = yv[nbr]                                     # (C, n, k+1)
+
+        # Centre each patch on the point itself (the self neighbour, dist 0).
+        cx = xj_nbr - XjT[:, :, None]                        # (C, n, k+1)
+        cy = yv_nbr - yv[None, :, None]
+        centred = np.stack([cx, cy], axis=-1)                # (C, n, k+1, 2)
+
+        dvec_x = np.maximum(np.max(np.abs(cx), axis=2), 1e-15)   # (C, n)
+        dvec_y = np.maximum(np.max(np.abs(cy), axis=2), 1e-15)
+
+        # Covariance over neighbours (self adds 0); dividing by k matches the
+        # original, which sums the k non-self neighbours.
+        cov = np.einsum("cnma,cnmb->cnab", centred, centred) / k     # (C, n, 2, 2)
+        _, eigvecs = np.linalg.eigh(cov)                            # (C, n, 2, 2)
+        projected = np.einsum("cnma,cnab->cnmb", centred, eigvecs)  # (C, n, k+1, 2)
+        max_proj = np.maximum(np.max(np.abs(projected), axis=2), 1e-30)  # (C, n, 2)
+
+        log_V_pca = np.sum(np.log(max_proj), axis=2)        # (C, n)
+        log_V_rect = np.log(dvec_x) + np.log(dvec_y)        # (C, n)
+        log_alpha = np.log(max(alpha, 1e-30))
+        lnc_mask = log_V_pca < log_V_rect + log_alpha
+        correction = np.where(
+            lnc_mask, log_V_rect - log_V_pca, 0.0
+        ).sum(axis=1) / n
+
+        return np.maximum(0.0, mi_ksg + correction)
 
     def _get_mi_estimators(self, _binary: bool):
         """Return (relevance_fn, redundancy_batch_fn) for MI estimation.
@@ -395,17 +487,25 @@ class MRMRPred(BenchPred):
         relevance_target = source_full_scores.mean(-1)
         regression_target = relevance_target
 
-        # Precompute relevance for every point (MI with relevance_target); it does not change during selection
-        relevance_per_idx = np.array(
-            [
-                _mi_rel(
-                    source_full_scores[:, idx], relevance_target, k=self.mi_k
-                )
-                for idx in tqdm(
-                    range(num_data), desc="Relevance (MI)", unit="point"
-                )
-            ]
-        )
+        # Precompute relevance for every point (MI with relevance_target); it
+        # does not change during selection.  Continuous data goes through the
+        # vectorised LNC batch (the partner is the single shared
+        # relevance_target); binary data keeps the per-point Ross estimator.
+        if _binary:
+            relevance_per_idx = np.array(
+                [
+                    _mi_rel(
+                        source_full_scores[:, idx], relevance_target, k=self.mi_k
+                    )
+                    for idx in tqdm(
+                        range(num_data), desc="Relevance (MI)", unit="point"
+                    )
+                ]
+            )
+        else:
+            relevance_per_idx = self._mutual_information_lnc_batch(
+                source_full_scores, relevance_target, k=self.mi_k
+            )
 
         if only_relevance:
             remaining_set: set[int] = set(range(num_data))

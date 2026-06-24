@@ -175,3 +175,5 @@ logs/
 logs
 .vscode/
 .vscode
+tmp/
+.python-version

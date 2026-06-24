@@ -146,3 +146,59 @@ for _base_key in _backfill_base_methods:
     all_methods[f"k{_base_key}+"] = _make_backfill_krr(_base_key, degree=2)
     all_methods[f"k3{_base_key}+"] = _make_backfill_krr(_base_key, degree=3)
     all_methods[f"k4{_base_key}+"] = _make_backfill_krr(_base_key, degree=4)
+
+# ---------------------------------------------------------------------------
+# DKPS (Data Kernel Perspective Space): response-based, transductive predictor.
+# Unlike every method above, it consumes raw model responses (HELM only) rather
+# than the score matrix; the runner detects this via ``requires_model_outputs``.
+# The import pulls the vendored DKPS code + graspologic (optional [dkps] extra),
+# so it is guarded: a missing graspologic disables DKPS without breaking the
+# rest of the registry.
+# ---------------------------------------------------------------------------
+try:
+    from .dkps import (
+        DKPSPred,
+        DKPSGooglePred,
+        DKPSMRMRPred,
+        _make_dkps_backfill,
+        _make_dkps_mrmr_variant,
+    )
+
+    all_methods["dkps"] = DKPSPred              # one-hot embedder (categorical tasks)
+    all_methods["dkps_google"] = DKPSGooglePred  # Gemini embedder (free-text tasks)
+
+    # Iterative, per-target DKPS-guided mRMR coreset selection (transductive,
+    # response-based, HELM-only).  Needs the runner's ``requires_full_target_outputs``
+    # branch.  ``k`` is the number of nearest source models restricting each
+    # inner mRMR pick; default scheme is MID.
+    all_methods["dkps_mrmr"] = DKPSMRMRPred                      # onehot, k=10, MID
+    all_methods["dkps_mrmr_google"] = _make_dkps_mrmr_variant(embedder="google")
+    for _k in (5, 15, 20):
+        all_methods[f"dkps_mrmr_k{_k}"] = _make_dkps_mrmr_variant(k=_k)
+    all_methods["dkps_mrmr_MIQ"] = _make_dkps_mrmr_variant(miq_scheme=True)
+    all_methods["dkps_mrmr_MI"] = _make_dkps_mrmr_variant(only_relevance=True)
+
+    # DKPS evaluated on coresets borrowed from other methods (backfill "+"
+    # style, e.g. anchor_points_weighted+).  Key naming: dkps+<base_key>.  Each
+    # requires the base method to have been run first so its coreset checkpoint
+    # exists (same dataset / seed / coreset_size / nmodels); otherwise the
+    # runner skips that trial.  Add a `dkps_google+<base>` for free-text tasks
+    # via `_make_dkps_backfill(base, embedder="google")`.
+    _dkps_backfill_base_methods = [
+        "anchor_points_weighted",
+        "mrmr5_MIQ_y",
+        "kmrmr5_MIQ_y",
+        "gpirt1",
+        "lasso",
+    ]
+    for _dkps_base in _dkps_backfill_base_methods:
+        if _dkps_base in all_methods:
+            all_methods[f"dkps+{_dkps_base}"] = _make_dkps_backfill(_dkps_base)
+except ImportError as _dkps_err:  # graspologic (or google-genai) not installed
+    import warnings as _warnings
+
+    _warnings.warn(
+        f"DKPS methods not registered: {_dkps_err}. "
+        "Install the optional extra with `pip install -e .[dkps]` to enable "
+        "'dkps' / 'dkps_google'."
+    )
